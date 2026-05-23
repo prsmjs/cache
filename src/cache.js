@@ -24,6 +24,7 @@ function makeRedis(redisOpt) {
 }
 
 export function createCache(options = {}) {
+  const tracer = options.tracer ?? null
   const prefix = options.prefix ?? 'cache:'
   const defaultTtl = toMs(options.defaultTtl ?? '5m', 5 * 60_000)
   const defaultStaleWhile = toMs(options.defaultStaleWhile, 0)
@@ -227,8 +228,7 @@ export function createCache(options = {}) {
     return outcome
   }
 
-  async function fetch(key, loader, fetchOptions = {}) {
-    await ensureReady()
+  async function fetchInternal(key, loader, fetchOptions = {}) {
     if (closed) throw new Error('cache is closed')
     if (typeof loader !== 'function') throw new TypeError('loader must be a function')
 
@@ -276,6 +276,17 @@ export function createCache(options = {}) {
     emitter.emit('miss', { key })
 
     return loadWithSingleFlight(key, loader, { ttlMs, staleWhileMs, negativeTtlMs, errorTtlMs, lockTtlMs, waitTimeoutMs, tags })
+  }
+
+  async function fetch(key, loader, fetchOptions = {}) {
+    await ensureReady()
+    if (!tracer) return fetchInternal(key, loader, fetchOptions)
+    return tracer.span('cache.fetch', { 'cache.key': key, 'cache.prefix': prefix }, async (span) => {
+      const value = await fetchInternal(key, async () => {
+        return tracer.span('cache.loader', { 'cache.key': key }, async () => loader())
+      }, fetchOptions)
+      return value
+    })
   }
 
   async function loadWithSingleFlight(key, loader, opts) {
@@ -374,8 +385,7 @@ export function createCache(options = {}) {
     return undefined
   }
 
-  async function set(key, value, setOptions = {}) {
-    await ensureReady()
+  async function setInternal(key, value, setOptions = {}) {
     const ttlMs = toMs(setOptions.ttl, defaultTtl)
     const staleWhileMs = toMs(setOptions.staleWhile, defaultStaleWhile)
     const tags = setOptions.tags ?? null
@@ -387,6 +397,12 @@ export function createCache(options = {}) {
     await writeRaw(key, entry, ttlMs + staleWhileMs, tags)
     stats.sets++
     emitter.emit('set', { key, ttl: ttlMs, tags })
+  }
+
+  async function set(key, value, setOptions = {}) {
+    await ensureReady()
+    if (!tracer) return setInternal(key, value, setOptions)
+    return tracer.span('cache.set', { 'cache.key': key }, () => setInternal(key, value, setOptions))
   }
 
   async function del(key) {
@@ -411,8 +427,7 @@ export function createCache(options = {}) {
     return !!isFresh(entry) && !entry.error
   }
 
-  async function invalidateTag(tag) {
-    await ensureReady()
+  async function invalidateTagInternal(tag) {
     const keys = await client.sMembers(tagKey(tag))
     if (!keys.length) {
       await client.del(tagKey(tag))
@@ -428,6 +443,12 @@ export function createCache(options = {}) {
     stats.invalidations++
     emitter.emit('invalidate', { tag, count: keys.length })
     return keys.length
+  }
+
+  async function invalidateTag(tag) {
+    await ensureReady()
+    if (!tracer) return invalidateTagInternal(tag)
+    return tracer.span('cache.invalidateTag', { 'cache.tag': tag }, () => invalidateTagInternal(tag))
   }
 
   async function close() {
