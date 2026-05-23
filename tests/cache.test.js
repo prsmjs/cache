@@ -509,6 +509,44 @@ describe('events and stats', () => {
   })
 })
 
+describe('multi-instance value visibility', () => {
+  it('set on instance A is visible to get on instance B', async () => {
+    const a = make()
+    const b = make()
+    await a.set('shared', { who: 'a' }, { ttl: '5s' })
+    expect(await b.get('shared')).toEqual({ who: 'a' })
+  })
+
+  it('invalidateTag on instance A removes the key from instance B view', async () => {
+    const a = make()
+    const b = make()
+    await a.set('k', 'v', { ttl: '1h', tags: ['t'] })
+    expect(await b.get('k')).toBe('v')
+    await a.invalidateTag('t')
+    expect(await b.get('k')).toBeUndefined()
+  })
+
+  it('SWR refresh triggered by one instance is observed by another', async () => {
+    const a = make()
+    const b = make()
+    let calls = 0
+    const loader = async () => { calls++; return calls }
+
+    await a.fetch('k', loader, { ttl: 80, staleWhile: 5_000 })
+    expect(calls).toBe(1)
+    await sleep(120)
+
+    const stale = await b.fetch('k', loader, { ttl: 80, staleWhile: 5_000 })
+    expect(stale).toBe(1)
+
+    await sleep(150)
+
+    const fresh = await a.fetch('k', loader, { ttl: 80, staleWhile: 5_000 })
+    expect(fresh).toBe(2)
+    expect(calls).toBe(2)
+  })
+})
+
 describe('configuration', () => {
   it('respects prefix isolation - caches with different prefixes do not see each other', async () => {
     const a = make({ prefix: 'pfx-a:' })
