@@ -1,0 +1,37 @@
+{
+  "name": "@prsm/cache",
+  "version": "1.0.0",
+  "description": "Distributed cache with stampede prevention, stale-while-revalidate, and tag invalidation",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "keywords": [
+    "cache",
+    "redis",
+    "distributed",
+    "stampede",
+    "single-flight",
+    "stale-while-revalidate",
+    "memoize"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@prsm/ms": "^2.0.0",
+    "redis": "^5.1.1"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  },
+  "license": "MIT"
+}
