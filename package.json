@@ -1,6 +1,6 @@
 {
   "name": "@prsm/cache",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Distributed cache with stampede prevention, stale-while-revalidate, and tag invalidation",
   "type": "module",
   "exports": {

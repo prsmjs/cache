@@ -170,63 +170,61 @@ export function createCache(options = {}) {
     const resultCh = resultChannel(key)
     const errorCh = errorChannel(key)
 
-    return new Promise((resolve, reject) => {
-      let settled = false
-      const timer = setTimeout(async () => {
+    let settled = false
+    let timer = null
+    let onResult, onError
+
+    const cleanup = async () => {
+      try { await subscriber.unsubscribe(resultCh, onResult) } catch {}
+      try { await subscriber.unsubscribe(errorCh, onError) } catch {}
+    }
+
+    const outcome = await new Promise((resolve, reject) => {
+      onResult = (message) => {
         if (settled) return
         settled = true
-        await Promise.all([
-          subscriber.unsubscribe(resultCh).catch(() => {}),
-          subscriber.unsubscribe(errorCh).catch(() => {}),
-        ])
+        clearTimeout(timer)
+        try { resolve({ status: 'value', entry: deserialize(message) }) }
+        catch (err) { reject(err) }
+      }
+      onError = (message) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        try {
+          const { message: m, name } = JSON.parse(message)
+          const err = new Error(m)
+          err.name = name
+          resolve({ status: 'error', error: err })
+        } catch (err) { reject(err) }
+      }
+      timer = setTimeout(() => {
+        if (settled) return
+        settled = true
         resolve({ status: 'timeout' })
       }, waitTimeoutMs)
-
-      const onResult = (message) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        Promise.all([
-          subscriber.unsubscribe(resultCh).catch(() => {}),
-          subscriber.unsubscribe(errorCh).catch(() => {}),
-        ]).finally(() => {
-          try {
-            resolve({ status: 'value', entry: deserialize(message) })
-          } catch (err) {
-            reject(err)
-          }
-        })
-      }
-
-      const onError = (message) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        Promise.all([
-          subscriber.unsubscribe(resultCh).catch(() => {}),
-          subscriber.unsubscribe(errorCh).catch(() => {}),
-        ]).finally(() => {
-          try {
-            const { message: m, name } = JSON.parse(message)
-            const err = new Error(m)
-            err.name = name
-            resolve({ status: 'error', error: err })
-          } catch (err) {
-            reject(err)
-          }
-        })
-      }
 
       Promise.all([
         subscriber.subscribe(resultCh, onResult),
         subscriber.subscribe(errorCh, onError),
-      ]).catch((err) => {
+      ]).then(async () => {
+        const entry = await readRaw(key)
+        if (settled) return
+        if (entry && !entry.error && Date.now() < entry.expiresAt) {
+          settled = true
+          clearTimeout(timer)
+          resolve({ status: 'value', entry })
+        }
+      }).catch((err) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
         reject(err)
       })
     })
+
+    await cleanup()
+    return outcome
   }
 
   async function fetch(key, loader, fetchOptions = {}) {
@@ -294,13 +292,6 @@ export function createCache(options = {}) {
     stats.stampedeWaits++
     emitter.emit('stampede:wait', { key })
     const waitedFrom = Date.now()
-
-    const fresh = await readRaw(key)
-    if (isFresh(fresh)) {
-      stats.stampedeSavings++
-      emitter.emit('stampede:result', { key, waitedMs: 0 })
-      return fresh.value
-    }
 
     const outcome = await waitForLeader(key, waitTimeoutMs)
     const waitedMs = Date.now() - waitedFrom

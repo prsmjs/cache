@@ -171,13 +171,61 @@ describe('stampede prevention', () => {
   it('a thrown loader error propagates to waiting instances', async () => {
     const a = make()
     const b = make()
+    let calls = 0
+    const fail = async () => {
+      calls++
+      await sleep(80)
+      throw new Error('downstream-out')
+    }
     const results = await Promise.allSettled([
-      a.fetch('k', async () => { await sleep(80); throw new Error('downstream-out') }),
-      b.fetch('k', async () => { await sleep(80); return 'should not be used' }),
+      a.fetch('k', fail),
+      b.fetch('k', fail),
     ])
-    const reasons = results.map((r) => r.status === 'rejected' ? r.reason.message : null)
-    expect(reasons).toContain('downstream-out')
-    expect(reasons.filter((m) => m === 'downstream-out').length).toBe(2)
+    expect(calls).toBe(1)
+    expect(results.every((r) => r.status === 'rejected')).toBe(true)
+    expect(results.every((r) => r.reason.message === 'downstream-out')).toBe(true)
+  })
+
+  it('multiple waiters on the same instance all receive the leader result', async () => {
+    const c = make()
+    let calls = 0
+    const loader = async () => { calls++; await sleep(100); return 'shared-result' }
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => c.fetch('k', loader))
+    )
+    expect(results.every((r) => r === 'shared-result')).toBe(true)
+    expect(calls).toBe(1)
+    expect(c.stats().stampedeLeads).toBe(1)
+    expect(c.stats().stampedeWaits).toBe(7)
+    expect(c.stats().stampedeSavings).toBe(7)
+  })
+
+  it('after a stampede completes the cache can be used again normally', async () => {
+    const c = make()
+    let calls = 0
+    const loader = async () => { calls++; await sleep(50); return calls }
+    await Promise.all([
+      c.fetch('k', loader),
+      c.fetch('k', loader),
+      c.fetch('k', loader),
+    ])
+    await c.del('k')
+    const fresh = await c.fetch('k', loader)
+    expect(fresh).toBe(2)
+    expect(calls).toBe(2)
+  })
+
+  it('five instances racing produce exactly one lead and four waits', async () => {
+    const instances = Array.from({ length: 5 }, () => make())
+    let calls = 0
+    const loader = async () => { calls++; await sleep(120); return 'one' }
+    const results = await Promise.all(instances.map((c) => c.fetch('k', loader)))
+    expect(results.every((r) => r === 'one')).toBe(true)
+    expect(calls).toBe(1)
+    const totalLeads = instances.reduce((sum, c) => sum + c.stats().stampedeLeads, 0)
+    const totalWaits = instances.reduce((sum, c) => sum + c.stats().stampedeWaits, 0)
+    expect(totalLeads).toBe(1)
+    expect(totalWaits).toBe(4)
   })
 
   it('a waiter that times out falls back to running its own loader once', async () => {
