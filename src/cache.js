@@ -41,9 +41,24 @@ export function createCache(options = {}) {
 
   const client = makeRedis(options.redis)
   const subscriber = client.duplicate()
+  const instanceId = randomUUID()
+  const eventsChannel = `${prefix}events`
 
   client.on('error', (err) => emitter.emit('error', { source: 'client', error: err }))
   subscriber.on('error', (err) => emitter.emit('error', { source: 'subscriber', error: err }))
+
+  const DISTRIBUTED_EVENTS = new Set([
+    'hit', 'miss', 'set', 'del', 'refresh', 'invalidate',
+    'stampede:lead', 'stampede:wait', 'stampede:result', 'stampede:timeout',
+  ])
+
+  function emit(name, data) {
+    const tagged = DISTRIBUTED_EVENTS.has(name) ? { ...data, instanceId } : data
+    emitter.emit(name, tagged)
+    if (DISTRIBUTED_EVENTS.has(name) && client.isOpen) {
+      client.publish(eventsChannel, JSON.stringify({ name, data: tagged, from: instanceId })).catch(() => {})
+    }
+  }
 
   const stats = {
     hits: 0,
@@ -74,6 +89,13 @@ export function createCache(options = {}) {
       readyPromise = (async () => {
         if (!client.isOpen) await client.connect()
         if (!subscriber.isOpen) await subscriber.connect()
+        await subscriber.subscribe(eventsChannel, (message) => {
+          try {
+            const { name, data, from } = JSON.parse(message)
+            if (from === instanceId) return
+            emitter.emit(name, data)
+          } catch {}
+        })
       })().catch((err) => {
         readyPromise = null
         throw err
@@ -250,20 +272,20 @@ export function createCache(options = {}) {
     if (isFresh(entry)) {
       if (entry.error) {
         stats.hits++
-        emitter.emit('hit', { key, fresh: true, error: true })
+        emit('hit', { key, fresh: true, error: true })
         const err = new Error(entry.error.message)
         err.name = entry.error.name
         err.cached = true
         throw err
       }
       stats.hits++
-      emitter.emit('hit', { key, fresh: true })
+      emit('hit', { key, fresh: true })
       return entry.value
     }
 
     if (isStaleServeable(entry) && staleWhileMs > 0 && !entry.error) {
       stats.hits++
-      emitter.emit('hit', { key, fresh: false })
+      emit('hit', { key, fresh: false })
       if (!refreshing.has(key)) {
         refreshing.add(key)
         backgroundRefresh(key, loader, { ttlMs, staleWhileMs, negativeTtlMs, errorTtlMs, lockTtlMs, tags })
@@ -273,7 +295,7 @@ export function createCache(options = {}) {
     }
 
     stats.misses++
-    emitter.emit('miss', { key })
+    emit('miss', { key })
 
     return loadWithSingleFlight(key, loader, { ttlMs, staleWhileMs, negativeTtlMs, errorTtlMs, lockTtlMs, waitTimeoutMs, tags })
   }
@@ -296,12 +318,12 @@ export function createCache(options = {}) {
 
     if (lockId) {
       stats.stampedeLeads++
-      emitter.emit('stampede:lead', { key })
+      emit('stampede:lead', { key })
       return runLoader(key, lockId, loader, { ttlMs, staleWhileMs, negativeTtlMs, errorTtlMs, tags })
     }
 
     stats.stampedeWaits++
-    emitter.emit('stampede:wait', { key })
+    emit('stampede:wait', { key })
     const waitedFrom = Date.now()
 
     const outcome = await waitForLeader(key, waitTimeoutMs)
@@ -309,23 +331,23 @@ export function createCache(options = {}) {
 
     if (outcome.status === 'value') {
       stats.stampedeSavings++
-      emitter.emit('stampede:result', { key, waitedMs })
+      emit('stampede:result', { key, waitedMs })
       return outcome.entry.value
     }
 
     if (outcome.status === 'error') {
-      emitter.emit('stampede:result', { key, waitedMs })
+      emit('stampede:result', { key, waitedMs })
       throw outcome.error
     }
 
     const settled = await readRaw(key)
     if (settled && (isFresh(settled) || isStaleServeable(settled))) {
       stats.stampedeSavings++
-      emitter.emit('stampede:result', { key, waitedMs })
+      emit('stampede:result', { key, waitedMs })
       return settled.value
     }
 
-    emitter.emit('stampede:timeout', { key, waitedMs })
+    emit('stampede:timeout', { key, waitedMs })
     return loader()
   }
 
@@ -341,7 +363,7 @@ export function createCache(options = {}) {
         const entry = makeEntry(value, effectiveTtl, staleWhileMs, tags)
         await writeRaw(key, entry, effectiveTtl + staleWhileMs, tags)
         stats.sets++
-        emitter.emit('set', { key, ttl: effectiveTtl, tags })
+        emit('set', { key, ttl: effectiveTtl, tags })
         await publishResult(key, entry)
       }
       return value
@@ -366,7 +388,7 @@ export function createCache(options = {}) {
     const lockId = await tryAcquireLock(key, lockTtlMs)
     if (!lockId) return
     stats.refreshes++
-    emitter.emit('refresh', { key })
+    emit('refresh', { key })
     try {
       await runLoader(key, lockId, loader, { ttlMs, staleWhileMs, negativeTtlMs, errorTtlMs, tags })
     } catch {}
@@ -377,11 +399,11 @@ export function createCache(options = {}) {
     const entry = await readRaw(key)
     if (isFresh(entry) && !entry.error) {
       stats.hits++
-      emitter.emit('hit', { key, fresh: true })
+      emit('hit', { key, fresh: true })
       return entry.value
     }
     stats.misses++
-    emitter.emit('miss', { key })
+    emit('miss', { key })
     return undefined
   }
 
@@ -396,7 +418,7 @@ export function createCache(options = {}) {
     const entry = makeEntry(value, ttlMs, staleWhileMs, tags)
     await writeRaw(key, entry, ttlMs + staleWhileMs, tags)
     stats.sets++
-    emitter.emit('set', { key, ttl: ttlMs, tags })
+    emit('set', { key, ttl: ttlMs, tags })
   }
 
   async function set(key, value, setOptions = {}) {
@@ -416,7 +438,7 @@ export function createCache(options = {}) {
     const removed = (results?.[0] ?? 0) > 0
     if (removed) {
       stats.dels++
-      emitter.emit('del', { key })
+      emit('del', { key })
     }
     return removed
   }
@@ -441,7 +463,7 @@ export function createCache(options = {}) {
     tx.del(tagKey(tag))
     await tx.exec()
     stats.invalidations++
-    emitter.emit('invalidate', { tag, count: keys.length })
+    emit('invalidate', { tag, count: keys.length })
     return keys.length
   }
 

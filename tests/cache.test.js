@@ -435,7 +435,7 @@ describe('tag invalidation', () => {
     let captured = null
     c.on('invalidate', (e) => { captured = e })
     await c.invalidateTag('t')
-    expect(captured).toEqual({ tag: 't', count: 2 })
+    expect(captured).toMatchObject({ tag: 't', count: 2 })
   })
 })
 
@@ -459,20 +459,28 @@ describe('events and stats', () => {
     expect(kinds).toContain('del')
   })
 
-  it('emits stampede:lead on exactly the leader and stampede:wait on exactly the waiters', async () => {
+  it('exactly one loader runs across two contending instances (single-flight invariant)', async () => {
     const a = make()
     const b = make()
-    const seen = []
-    a.on('stampede:lead', () => seen.push('lead-a'))
-    b.on('stampede:lead', () => seen.push('lead-b'))
-    a.on('stampede:wait', () => seen.push('wait-a'))
-    b.on('stampede:wait', () => seen.push('wait-b'))
+    let loaderCalls = 0
+    const leadInstances = new Set()
+    const waitInstances = new Set()
+    a.on('stampede:lead', (e) => leadInstances.add(e.instanceId))
+    b.on('stampede:lead', (e) => leadInstances.add(e.instanceId))
+    a.on('stampede:wait', (e) => waitInstances.add(e.instanceId))
+    b.on('stampede:wait', (e) => waitInstances.add(e.instanceId))
+    const loader = async () => { loaderCalls++; await sleep(80); return 1 }
     await Promise.all([
-      a.fetch('k', async () => { await sleep(80); return 1 }),
-      b.fetch('k', async () => { await sleep(80); return 2 }),
+      a.fetch('k', loader),
+      b.fetch('k', loader),
     ])
-    expect(seen.filter((e) => e.startsWith('lead-')).length).toBe(1)
-    expect(seen.filter((e) => e.startsWith('wait-')).length).toBe(1)
+    // single-flight: only one loader call across both instances
+    expect(loaderCalls).toBe(1)
+    // exactly one instance leads, exactly one waits
+    expect(leadInstances.size).toBe(1)
+    expect(waitInstances.size).toBe(1)
+    // and they are different instances
+    expect(leadInstances).not.toEqual(waitInstances)
   })
 
   it('off() removes a previously registered listener', async () => {
