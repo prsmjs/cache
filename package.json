@@ -5,14 +5,18 @@
   "type": "module",
   "exports": {
     ".": {
+      "types": "./types/index.d.ts",
       "default": "./src/index.js"
     }
   },
+  "types": "./types/index.d.ts",
   "files": [
-    "src"
+    "src",
+    "types"
   ],
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npx tsc --declaration --allowJs --emitDeclarationOnly --skipLibCheck --target es2020 --module nodenext --moduleResolution nodenext --strict false --esModuleInterop true --outDir ./types src/index.js src/cache.js"
   },
   "keywords": [
     "cache",
@@ -32,6 +36,7 @@
   },
   "devDependencies": {
     "@prsm/trace": "^1.2.0",
+    "typescript": "^5.9.3",
     "vitest": "^3.0.0"
   },
   "license": "MIT"

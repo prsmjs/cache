@@ -5,6 +5,83 @@ import ms from '@prsm/ms'
 
 const RELEASE_SCRIPT = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`
 
+/**
+ * @typedef {Object} RedisOptions
+ * Connection settings forwarded to node-redis `createClient`. Omit to connect to redis on localhost:6379. You may also pass an existing node-redis client instead of this object, in which case the cache uses it directly and calls `.duplicate()` for its subscriber.
+ * @property {string} [url] - full connection string, e.g. `redis://user:pass@host:6379/0`. Takes precedence over the discrete host/port fields below
+ * @property {string} [host] - redis host (default `127.0.0.1`)
+ * @property {number} [port] - redis port (default `6379`)
+ * @property {string} [password] - password, if the server requires auth
+ * @property {number} [db] - database index to select (default: the server default, usually `0`)
+ */
+
+/**
+ * @typedef {Object} CacheOptions
+ * @property {RedisOptions|object} [redis] - redis connection settings, or an existing node-redis client to reuse. When a client is passed, the cache duplicates it for the pub/sub subscriber rather than opening fresh connections
+ * @property {string} [prefix] - namespace prepended to every redis key this cache touches (default `"cache:"`). Two caches sharing a redis instance but using different prefixes do not see each other's data or invalidation events
+ * @property {string|number} [defaultTtl] - default fresh lifetime for `fetch` and `set`, as a duration string (`"5m"`, `"30s"`) or milliseconds (default `"5m"`). A ttl of `0` disables caching: `fetch` just runs the loader and `set` deletes the key
+ * @property {string|number} [defaultStaleWhile] - default stale-while-revalidate window measured past the ttl (default `0`, disabled). When greater than zero, an expired-but-still-stale entry is served immediately while a single background refresh runs, so requests never block on regeneration
+ * @property {string|number|null} [defaultNegativeTtl] - default ttl for caching `null` loader results so repeated misses do not keep hitting the backend (default `null`, meaning nulls are not cached). `undefined` results are never cached regardless of this setting
+ * @property {string|number} [defaultErrorTtl] - default ttl for caching a thrown loader error so a backend outage does not cascade into a stampede (default `0`, disabled). A cached error is re-thrown to callers with `error.cached === true` until it expires
+ * @property {string|number} [defaultLockTtl] - default lifetime of the per-key single-flight lock held by the loader leader (default `"30s"`). This is a crash safety net: if the leader dies mid-load the lock auto-expires so another caller can take over. Set it longer than the slowest expected loader run
+ * @property {string|number} [waitTimeout] - how long a non-leader request waits on the pub/sub result channel for the leader to finish before giving up and running the loader itself (default `"10s"`)
+ * @property {(value: any) => string} [serialize] - function used to encode cache entries before writing to redis (default `JSON.stringify`). Must round-trip with `deserialize`
+ * @property {(raw: string) => any} [deserialize] - function used to decode cache entries read from redis (default `JSON.parse`). Must round-trip with `serialize`
+ * @property {object} [tracer] - optional `@prsm/trace` tracer; when set, `fetch`, `set`, `invalidateTag`, and each loader run execute inside spans
+ */
+
+/**
+ * @typedef {Object} FetchOptions
+ * @property {string|number} [ttl] - fresh lifetime for this entry, overriding `defaultTtl`. A ttl of `0` bypasses the cache and just runs the loader
+ * @property {string|number} [staleWhile] - stale-while-revalidate window for this entry, overriding `defaultStaleWhile`
+ * @property {string|number|null} [negativeTtl] - ttl for caching a `null` result, overriding `defaultNegativeTtl`
+ * @property {string|number} [errorTtl] - ttl for caching a thrown error, overriding `defaultErrorTtl`
+ * @property {string|number} [lockTtl] - single-flight lock lifetime for this fetch, overriding `defaultLockTtl`
+ * @property {string|number} [waitTimeout] - how long to wait for the leader's result before loading locally, overriding the cache-level `waitTimeout`
+ * @property {string[]} [tags] - tags to attach to the cached entry so `invalidateTag` can wipe it later
+ */
+
+/**
+ * @typedef {Object} SetOptions
+ * @property {string|number} [ttl] - fresh lifetime for the value, overriding `defaultTtl`. A ttl of `0` deletes the key instead of writing it
+ * @property {string|number} [staleWhile] - stale-while-revalidate window past the ttl, overriding `defaultStaleWhile`
+ * @property {string[]} [tags] - tags to attach so `invalidateTag` can wipe this key later
+ */
+
+/**
+ * @typedef {Object} CacheStats
+ * @property {number} hits - entries served from cache, fresh or stale
+ * @property {number} misses - lookups that found no usable entry and triggered a load
+ * @property {number} sets - values written to redis
+ * @property {number} dels - keys removed via `del`
+ * @property {number} errors - loader invocations that threw
+ * @property {number} refreshes - background stale-while-revalidate refreshes started
+ * @property {number} stampedeLeads - times this instance won the single-flight lock and ran the loader
+ * @property {number} stampedeWaits - times this instance waited on a leader instead of loading
+ * @property {number} stampedeSavings - waits that received the leader's result, avoiding a redundant load
+ * @property {number} invalidations - tag invalidations performed
+ */
+
+/**
+ * @callback Loader
+ * @returns {Promise<any>|any} the value to cache. Returning `undefined` caches nothing; returning `null` caches only when a negative ttl applies
+ */
+
+/**
+ * @typedef {Object} Cache
+ * @property {() => Promise<void>} ready - ensure both redis connections are open and the event subscription is active. Called implicitly by every method, but useful to await up front so the first request does not pay the connect cost
+ * @property {(key: string, loader: Loader, options?: FetchOptions) => Promise<any>} fetch - read-through fetch: return the cached value, or run `loader` on a miss with single-flight coordination so concurrent callers across all instances trigger only one load
+ * @property {(key: string) => Promise<any|undefined>} get - return the value only if the key is currently fresh, otherwise `undefined`. Never runs a loader and never serves stale entries
+ * @property {(key: string, value: any, options?: SetOptions) => Promise<void>} set - write a value directly, bypassing the loader path
+ * @property {(key: string) => Promise<boolean>} del - remove a key and its tag membership. Resolves `true` if a key was actually removed
+ * @property {(key: string) => Promise<boolean>} has - resolve `true` if the key is fresh and not an error entry
+ * @property {(tag: string) => Promise<number>} invalidateTag - remove every key tagged with `tag` and resolve the count removed
+ * @property {() => Promise<void>} close - quit both redis connections. The cache is unusable afterward and `fetch` will throw
+ * @property {() => CacheStats} stats - snapshot the running counters for this instance (counters are per-process, not shared across instances)
+ * @property {(event: string, handler: (data: any) => void) => void} on - subscribe to a cache event. Events: `hit`, `miss`, `set`, `del`, `invalidate`, `refresh`, `stampede:lead`, `stampede:wait`, `stampede:result`, `stampede:timeout`, and `error`. The distributed events also fire when other instances act on the shared prefix
+ * @property {(event: string, handler: (data: any) => void) => void} off - unsubscribe a handler previously registered with `on`
+ */
+
 function toMs(value, fallback = null) {
   if (value === null || value === undefined) return fallback
   if (typeof value === 'number') return value
@@ -23,6 +100,13 @@ function makeRedis(redisOpt) {
   return createClient(opts)
 }
 
+/**
+ * Create a distributed read-through cache backed by redis. The cache prevents
+ * stampedes via per-key single-flight locking, supports stale-while-revalidate,
+ * and can invalidate groups of keys by tag.
+ * @param {CacheOptions} [options]
+ * @returns {Cache}
+ */
 export function createCache(options = {}) {
   const tracer = options.tracer ?? null
   const prefix = options.prefix ?? 'cache:'
@@ -84,6 +168,12 @@ export function createCache(options = {}) {
   const resultChannel = (k) => `${prefix}result:${k}`
   const errorChannel = (k) => `${prefix}error:${k}`
 
+  /**
+   * Ensure both redis connections are open and the event subscription is active.
+   * Idempotent and called implicitly by every method; await it up front to avoid
+   * paying the connect cost on the first request.
+   * @returns {Promise<void>}
+   */
   function ensureReady() {
     if (!readyPromise) {
       readyPromise = (async () => {
@@ -300,6 +390,15 @@ export function createCache(options = {}) {
     return loadWithSingleFlight(key, loader, { ttlMs, staleWhileMs, negativeTtlMs, errorTtlMs, lockTtlMs, waitTimeoutMs, tags })
   }
 
+  /**
+   * Read-through fetch. Returns the cached value if fresh; on a miss, coordinates
+   * a single-flight load across every instance sharing this prefix so the loader
+   * runs once and the rest receive the result over pub/sub.
+   * @param {string} key - cache key (stored under the cache prefix)
+   * @param {Loader} loader - called on a miss to produce the value
+   * @param {FetchOptions} [fetchOptions]
+   * @returns {Promise<any>} the cached or freshly loaded value
+   */
   async function fetch(key, loader, fetchOptions = {}) {
     await ensureReady()
     if (!tracer) return fetchInternal(key, loader, fetchOptions)
@@ -394,6 +493,12 @@ export function createCache(options = {}) {
     } catch {}
   }
 
+  /**
+   * Return the value only if the key is currently fresh. Does not run any loader
+   * and does not serve stale entries.
+   * @param {string} key - cache key
+   * @returns {Promise<any|undefined>} the value, or `undefined` if missing, stale, or an error entry
+   */
   async function get(key) {
     await ensureReady()
     const entry = await readRaw(key)
@@ -421,12 +526,24 @@ export function createCache(options = {}) {
     emit('set', { key, ttl: ttlMs, tags })
   }
 
+  /**
+   * Write a value directly, bypassing the loader path. A ttl of `0` deletes the key.
+   * @param {string} key - cache key
+   * @param {any} value - value to store
+   * @param {SetOptions} [setOptions]
+   * @returns {Promise<void>}
+   */
   async function set(key, value, setOptions = {}) {
     await ensureReady()
     if (!tracer) return setInternal(key, value, setOptions)
     return tracer.span('cache.set', { 'cache.key': key }, () => setInternal(key, value, setOptions))
   }
 
+  /**
+   * Remove a key and its tag membership.
+   * @param {string} key - cache key
+   * @returns {Promise<boolean>} true if a key was actually removed
+   */
   async function del(key) {
     await ensureReady()
     const prevTags = await client.sMembers(keyTagsKey(key))
@@ -443,6 +560,11 @@ export function createCache(options = {}) {
     return removed
   }
 
+  /**
+   * Check whether a key is fresh without serving stale entries or running a loader.
+   * @param {string} key - cache key
+   * @returns {Promise<boolean>} true if the key is fresh and not an error entry
+   */
   async function has(key) {
     await ensureReady()
     const entry = await readRaw(key)
@@ -467,12 +589,22 @@ export function createCache(options = {}) {
     return keys.length
   }
 
+  /**
+   * Remove every key that was stored with `tag`. The invalidation is broadcast to
+   * other instances sharing the prefix via the `invalidate` event.
+   * @param {string} tag - tag to invalidate
+   * @returns {Promise<number>} the number of keys removed
+   */
   async function invalidateTag(tag) {
     await ensureReady()
     if (!tracer) return invalidateTagInternal(tag)
     return tracer.span('cache.invalidateTag', { 'cache.tag': tag }, () => invalidateTagInternal(tag))
   }
 
+  /**
+   * Quit both redis connections. The cache is unusable afterward.
+   * @returns {Promise<void>}
+   */
   async function close() {
     if (closed) return
     closed = true
